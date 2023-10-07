@@ -6,13 +6,7 @@
 #include <time.h>
 #include <math.h>
 #include <string.h>
-#include <fcntl.h>
-#if defined _WIN32
-    #include "win.h"
-#else
-    #include <unistd.h>
-    #include <sys/mman.h>
-#endif
+#include <sys/mman.h>
 #include "story.h"
 #include "tokens.h"
 
@@ -118,7 +112,6 @@ void free_run_state(RunState* s) {
 
 void memory_map_weights(TransformerWeights *w, Config* p, int shared_weights) {
     int head_size = p->dim / p->n_heads;
-    // make sure the multiplications below are done in 64bit to fit the parameter counts of 13B+ models
     unsigned long long n_layers = p->n_layers;
     float *ptr = story;
     w->token_embedding_table = ptr;
@@ -164,7 +157,6 @@ void read_checkpoint(Config* config, TransformerWeights* weights,
 }
 
 void build_transformer(Transformer *t) {
-    // read in the Config and the Weights from the checkpoint
     read_checkpoint(&t->config, &t->weights, &t->fd, &t->data, &t->file_size);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
@@ -362,26 +354,13 @@ float* forward(Transformer* transformer, int token, int pos) {
     return s->logits;
 }
 
-// ----------------------------------------------------------------------------
-// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
-
-typedef struct {
-    char *str;
-    int id;
-} TokenIndex;
-
 typedef struct {
     char** vocab;
     float* vocab_scores;
-    TokenIndex *sorted_vocab;
     int vocab_size;
     unsigned int max_token_length;
     unsigned char byte_pieces[512]; // stores all single-byte strings
 } Tokenizer;
-
-int compare_tokens(const void *a, const void *b) {
-    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
-}
 
 void build_tokenizer(Tokenizer* t, int vocab_size) {
     // i should have written the vocab_size into the tokenizer file... sigh
@@ -389,7 +368,6 @@ void build_tokenizer(Tokenizer* t, int vocab_size) {
     // malloc space to hold the scores and the strings
     t->vocab = (char**)malloc(vocab_size * sizeof(char*));
     t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));
-    t->sorted_vocab = NULL; // initialized lazily
     for (int i = 0; i < 256; i++) {
         t->byte_pieces[i * 2] = (unsigned char)i;
         t->byte_pieces[i * 2 + 1] = '\0';
@@ -409,148 +387,6 @@ char* decode(Tokenizer* t, int prev_token, int token) {
         piece = (char*)t->byte_pieces + byte_val * 2;
     }
     return piece;
-}
-
-void safe_printf(char *piece) {
-    // piece might be a raw byte token, and we only want to print printable chars or whitespace
-    // because some of the other bytes can be various control codes, backspace, etc.
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return; // bad byte, don't print it
-        }
-    }
-    printf("%s", piece);
-}
-
-int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
-    // efficiently find the perfect match for str in vocab, return its index or -1 if not found
-    TokenIndex tok = { .str = str }; // acts as the key to search for
-    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
-    return res != NULL ? res->id : -1;
-}
-
-void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
-    // encode the string text (input) into an upper-bound preallocated tokens[] array
-    // bos != 0 means prepend the BOS token (=1), eos != 0 means append the EOS token (=2)
-    if (text == NULL) { fprintf(stderr, "cannot encode NULL text\n"); exit(EXIT_FAILURE); }
-
-    if (t->sorted_vocab == NULL) {
-        // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
-        for (int i = 0; i < t->vocab_size; i++) {
-            t->sorted_vocab[i].str = t->vocab[i];
-            t->sorted_vocab[i].id = i;
-        }
-        qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
-    }
-
-    // create a temporary buffer that will store merge candidates of always two consecutive tokens
-    // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
-    size_t str_len = 0;
-
-    // start at 0 tokens
-    *n_tokens = 0;
-
-    // add optional BOS (=1) token, if desired
-    if (bos) tokens[(*n_tokens)++] = 1;
-
-    // add_dummy_prefix is true by default
-    // so prepend a dummy prefix token to the input string, but only if text != ""
-    // TODO: pretty sure this isn't correct in the general case but I don't have the
-    // energy to read more of the sentencepiece code to figure out what it's doing
-    if (text[0] != '\0') {
-        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
-        tokens[(*n_tokens)++] = dummy_prefix;
-    }
-
-    // Okay UTF-8 time. This will get messy. Here is the reference from Wikipedia:
-    // Code point ↔ UTF-8 conversion
-    // First code point	Last code point	Byte 1	Byte 2	Byte 3	Byte 4
-    // U+0000	U+007F	    0xxxxxxx
-    // U+0080	U+07FF	    110xxxxx	10xxxxxx
-    // U+0800	U+FFFF	    1110xxxx	10xxxxxx	10xxxxxx
-    // U+10000	U+10FFFF    11110xxx	10xxxxxx	10xxxxxx	10xxxxxx
-
-    // process the raw (UTF-8) byte sequence of the input string
-    for (char *c = text; *c != '\0'; c++) {
-
-        // reset buffer if the current byte is ASCII or a leading byte
-        // 0xC0 is 11000000, so (*c & 0xC0) keeps the first 2 bits and zeros the rest
-        // 0x80 is 10000000
-        // in UTF-8, all continuation bytes start with "10" in first two bits
-        // so in English this is: "if this byte is not a continuation byte"
-        if ((*c & 0xC0) != 0x80) {
-            // this byte must be either a leading byte (11...) or an ASCII char (0x...)
-            // => reset our location, as we're starting a new UTF-8 codepoint
-            str_len = 0;
-        }
-
-        // append the current byte to the buffer
-        str_buffer[str_len++] = *c; // ++ is post-increment, incremented after this line
-        str_buffer[str_len] = '\0';
-
-        // while the next character is a continuation byte, continue appending
-        // but if there are too many of them, just stop to avoid overruning str_buffer size.
-        if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
-            continue;
-        }
-
-        // ok c+1 is not a continuation byte, so we've read in a full codepoint
-        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-
-        if (id != -1) {
-            // we found this codepoint in vocab, add it as a token
-            tokens[(*n_tokens)++] = id;
-        } else {
-            // byte_fallback encoding: just encode each byte as a token
-            // +3 is here because the first 3 vocab elements are <unk>, <s>, </s>
-            // so the individual bytes only start at index 3
-            for (int i=0; i < str_len; i++) {
-                tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
-            }
-        }
-        str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
-    }
-
-    // merge the best consecutive pair each iteration, according the scores in vocab_scores
-    while (1) {
-        float best_score = -1e10;
-        int best_id = -1;
-        int best_idx = -1;
-
-        for (int i=0; i < (*n_tokens-1); i++) {
-            // check if we can merge the pair (tokens[i], tokens[i+1])
-            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
-            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
-            if (id != -1 && t->vocab_scores[id] > best_score) {
-                // this merge pair exists in vocab! record its score and position
-                best_score = t->vocab_scores[id];
-                best_id = id;
-                best_idx = i;
-            }
-        }
-
-        if (best_idx == -1) {
-            break; // we couldn't find any more pairs to merge, so we're done
-        }
-
-        // merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-        tokens[best_idx] = best_id;
-        // delete token at position best_idx+1, shift the entire sequence back 1
-        for (int i = best_idx+1; i < (*n_tokens-1); i++) {
-            tokens[i] = tokens[i+1];
-        }
-        (*n_tokens)--; // token length decreased
-    }
-
-    // add optional EOS (=2) token, if desired
-    if (eos) tokens[(*n_tokens)++] = 2;
-
-    free(str_buffer);
 }
 
 // ----------------------------------------------------------------------------
@@ -581,14 +417,6 @@ int sample_mult(float* probabilities, int n, float coin) {
         }
     }
     return n - 1; // in case of rounding errors
-}
-
-int compare(const void* a, const void* b) {
-    ProbIndex* a_ = (ProbIndex*) a;
-    ProbIndex* b_ = (ProbIndex*) b;
-    if (a_->prob > b_->prob) return -1;
-    if (a_->prob < b_->prob) return 1;
-    return 0;
 }
 
 void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
@@ -642,37 +470,18 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-    char *empty_prompt = "";
-    if (prompt == NULL) { prompt = empty_prompt; }
-
-    // encode the (string) prompt into tokens sequence
-    int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-    if (num_prompt_tokens < 1) {
-        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-        exit(EXIT_FAILURE);
-    }
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, int steps) {
 
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int token = 426; // kick off with the first token 
     int pos = 0;     // position in the sequence
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
         float* logits = forward(transformer, token, pos);
-
-        // advance the state machine
-        if (pos < num_prompt_tokens - 1) {
-            // if we are still processing the input prompt, force the next prompt token
-            next = prompt_tokens[pos + 1];
-        } else {
-            // otherwise sample the next token from the logits
-            next = sample(sampler, logits);
-        }
+        next = sample(sampler, logits);
         pos++;
 
         // data-dependent terminating condition: the BOS (=1) token delimits sequences
@@ -680,7 +489,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
         // print the token as string, decode it with the Tokenizer object
         char* piece = decode(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        printf("%s",piece); 
         fflush(stdout);
         token = next;
 
@@ -694,8 +503,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         long end = time_in_ms();
         fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
     }
-
-    free(prompt_tokens);
 }
 
 int main(int argc, char *argv[]) {
@@ -704,38 +511,21 @@ int main(int argc, char *argv[]) {
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
-    char *prompt = NULL;        // prompt string
-    unsigned long long rng_seed = 0; // seed rng with time by default
-    char *system_prompt = NULL; 
-
-    // poor man's C argparse so we can override the defaults above from the command line
-    for (int i = 2; i < argc; i+=2) {
-        // read in the args
-        if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
-        else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
-        else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
-    }
+    unsigned long long rng_seed; // seed rng with time by default
 
     // parameter validation/overrides
     rng_seed = (unsigned int)time(NULL);
-    if (temperature < 0.0) temperature = 0.0;
-    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
-    if (steps < 0) steps = 0;
 
-    // build the Transformer via the model .bin file
     Transformer transformer;
     build_transformer(&transformer);
-    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
-    // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, transformer.config.vocab_size);
 
     // build the Sampler
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
-    generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    generate(&transformer, &tokenizer, &sampler, steps);
 
     // memory and file handles cleanup
     free_sampler(&sampler);
