@@ -1,5 +1,9 @@
 # nanoLLaMA with stories
 
+This is a minimal implementation of [Andrej Karpathy](https://karpathy.ai/)'s [llama2.c](https://github.com/karpathy/llama2.c) project.
+
+To reduce the parameters to be passed to the executable to zero I inserted the stories260k model data and the tokenizer data into the header file. That's all.
+
 gcc -O3 -o stories stories.c -lm
 
 ./stories
